@@ -1,0 +1,174 @@
+---
+layout: post
+title:  "XSRF in Angular PCKE and Dotnet Core"
+date:   2024-07-19 00:00:00 -0800
+categories: jekyll update
+---
+
+# General Attack Theory:
+
+XSRF (cross-site request forgery) or CSRF (commonly pronounced “sea-surf”) is designed to protect against attacks where the attacker hijacks the victim’s authentication token to make use of an API. The API might change a victim’s email or transfer funds. Generally, the attacker gets the victim to visit a malicious site after the victim is already authenticated. Upon loading the malicious site, API calls are made using the victim’s session cookie.
+
+---
+
+## Attack in Steps:
+1. Get the victim authentication on the site you want to target (`mybank.com`)
+2. Get the victim to visit the attack site (`myXsrfSite.com`)
+3. Execute JavaScript on the attack page load to get the `mybank.com` authentication token from the session.
+4. Execute JavaScript on the attack page load to hit the desired `mybank.com` API endpoint using the victim’s authentication token (e.g., `mybank.com/transferAllTheDough`)
+
+---
+
+## Mitigation through PCKE:
+XSRF attacks can be mitigated by using OAuth 2.0 PCKE.
+1. PCKE initiates authentication with a randomly generated code-challenge sent from the client to the server to get an access code.
+2. The server returns an authorization code to the client.
+3. The client exchanges the code for an access token and sends the initial code-challenge along with the request.
+  - The server stored the code-challenge from the initial request, so if things don’t match, an auth-token won’t be granted.
+
+***  
+***  
+
+## Mitigation through XSRF Token 
+
+### Server-Side
+**Overview:** From a server perspective, we need to do three things:
+1. Add an XSRF cookie to the first API request to store the token on the UI.
+2. Turn on XSRF validation for our APIs.
+3. Add the XSRF token header to relevant responses.
+
+
+
+## 1. Add an XSRF cookie to the first API request to store the token on the UI.
+
+```csharp
+public void Configure(IApplicationBuilder app, IWebHostEnvironment env, IAntiforgery antiforgery)
+{   
+    // Other code
+    app.Use((context, next) =>
+    {
+        // Other code
+        if (context.Request.GetDisplayUrl().Contains(Constants.InitialXsrfEndpoint, StringComparison.InvariantCultureIgnoreCase))
+        {
+            var tokens = _antiForgery.GetAndStoreTokens(context);
+            context.Response.Cookies.Append(_configuration.GetValue<string>(PortalAuthConstants.XsrfCookieName), tokens.RequestToken!,
+                new CookieOptions
+                {
+                    Domain = _configuration.GetDomain(Constants.BaseUrl),
+                    HttpOnly = false,
+                    Secure = true
+                });
+        }
+    });
+
+    // Make sure UseEndpoints comes after the xsrf cookie.
+    app.UseEndpoints();
+}
+```
+**Code:**
+- Create an endpoint used to get the XSRF token. The UI will only call this when the app loads or page refreshes.
+- The cookie is automatically added to the response.
+```csharp
+[Route("api/[Controller]/[Action]")]
+[Produces("application/json")]
+[ApiController]
+[Authorize(AuthenticationSchemes = IdentityServerAuthenticationDefaults.AuthenticationScheme)]
+public class XsrfController : Controller
+{
+    [HttpHead]
+    public IActionResult InitXsrf()
+    {
+        return Ok();
+    }
+}
+```
+
+
+## 2/3. Turn on XSRF validation for our API’s in startup.cs and add the XSRF token header to relevant responses.
+
+```csharp
+public void ConfigureServices(IServiceCollection services)
+{
+    // Turn on auto-xsrf validation:
+    services.AddControllers(options => { options.Filters.Add(new AutoValidateAntiforgeryTokenAttribute()); });
+            
+    services.AddAntiforgery(options => 
+    {
+        options.HeaderName = ApplicationConstants.XsrfHeaderName;
+    });
+}
+```
+## Client-Side Overview:
+
+### 1. Get an XSRF token on app load before making requests that need it (e.g., POST). In `app.component.ts`:
+```typescript
+ngOnInit() {
+  this.authCheckSubscription = this.oidcSecurityService.checkAuth().subscribe(
+    ({ isAuthenticated, userData, accessToken }) => {
+      if (!isAuthenticated) {
+        this.login();
+      } else {
+        this.redirect();
+        this._xsrfService.initXsrf().pipe(take(1)).subscribe();
+      }
+    },
+    () => {
+      console.error("An error has occurred.");
+      this.logoffAndRevokeTokens();
+    });
+}
+
+export class XsrfService {
+  constructor(private _httpClient: HttpClient, private _configService: HhsgSharedConfigService) { }
+
+  public initXsrf(): Observable<any> {
+    let url = `${this._configService.appSettings.webApiServer}/api/Xsrf/InitXsrf`;
+    return this._httpClient.head<any>(url, { withCredentials: true });
+  }
+}
+```
+
+## 2. Set an XSRF header on requests needing it (e.g., POST).
+
+Note: If your UI and API URLs are the same, you can simply use the `HttpClientXsrfModule`. However, if they’re different (e.g., mysite.com & mysite.api.com), you'll need to use the interceptor outlined below. The reason is that you’ll need to make a request via an absolute URL to reach your API, which is not allowed in the `HttpClientXsrfModule`. Regardless, we still specify the `cookieName` in the `HttpModule`. This tells the `HttpXsrfTokenExtractor` what cookie to look at when it’s trying to find the XSRF token to add to the header in the custom interceptor.
+
+```typescript
+@Injectable()
+export class HttpXsrfInterceptor implements HttpInterceptor {
+  private _allowedMethods = ['POST', 'PUT', 'PATCH', 'DELETE'];
+
+  constructor(private tokenExtractor: HttpXsrfTokenExtractor) {}
+
+  intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    if (req.url.toLowerCase().includes(environment.baseApiUrl) && this._allowedMethods.includes(req.method)) {
+      req = req.clone({
+        headers: this.addXsrfToken(req),
+        withCredentials: true
+      });
+    }
+
+    return next.handle(req);
+  }
+
+  private addXsrfToken(req: HttpRequest<any>) {
+    let xsrfToken = this.tokenExtractor.getToken();
+    return xsrfToken ? req.headers.set(environment.xsrfHeaderName, xsrfToken) : req.headers;
+  }
+}
+
+@NgModule({
+  declarations: [
+    // declarations
+  ],
+  imports: [
+    // other imports
+    HttpClientXsrfModule.withOptions({ cookieName: environment.xsrfCookieName })
+  ],
+  providers: [
+    // other providers
+    { provide: HTTP_INTERCEPTORS, useClass: XsrfInterceptor, multi: true },
+  ]
+})
+```
+
+
